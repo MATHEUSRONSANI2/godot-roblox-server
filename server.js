@@ -1,104 +1,162 @@
-const http = require("http")
-const os = require("os")
+const http = require("http");
+const os = require("os");
+const si = require("systeminformation");
 
-let players = {}
-let chat = []
+// Armazenamento
+let players = {}; // { playerId: { name, x, y, z } }
+let chat = [];
 
-// 🔧 Funções de status
-function getRAM() {
-    const total = os.totalmem() / 1024 / 1024
-    const free = os.freemem() / 1024 / 1024
-    const used = total - free
+// Controle de rate limiting simples: { ip: [timestamps] }
+const rateLimitStore = new Map();
+const RATE_LIMIT_MAX = 10;      // máximo de requisições
+const RATE_LIMIT_WINDOW = 10000; // em milissegundos (10s)
 
-    return `${used.toFixed(0)}MB / ${total.toFixed(0)}MB`
+// Helpers
+function sanitizeString(str, maxLength = 16) {
+    if (typeof str !== "string") return null;
+    return str.trim().substring(0, maxLength).replace(/[<>'"&]/g, ""); // evita XSS básico
 }
 
-function getCPU() {
-    return os.loadavg()[0].toFixed(2) + "%"
+function isValidNumber(val) {
+    return typeof val === "number" && isFinite(val);
 }
 
-const server = http.createServer((req, res) => {
+function getClientIP(req) {
+    return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress;
+}
 
-    // Permitir conexão externa
-    res.setHeader("Access-Control-Allow-Origin", "*")
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST")
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type")
+function isRateLimited(ip) {
+    const now = Date.now();
+    if (!rateLimitStore.has(ip)) {
+        rateLimitStore.set(ip, [now]);
+        return false;
+    }
 
-    // 📥 Receber dados
+    const timestamps = rateLimitStore.get(ip).filter(t => now - t < RATE_LIMIT_WINDOW);
+    if (timestamps.length >= RATE_LIMIT_MAX) {
+        return true; // bloqueado
+    }
+
+    timestamps.push(now);
+    rateLimitStore.set(ip, timestamps);
+    return false;
+}
+
+// Métricas
+async function getSystemStatus() {
+    const ram = await si.mem();
+    const cpu = await si.currentLoad();
+
+    return {        ram: `${Math.round((ram.total - ram.available) / 1024 / 1024)}MB / ${Math.round(ram.total / 1024 / 1024)}MB`,
+        cpu: `${cpu.currentLoad.toFixed(2)}%`
+    };
+}
+
+// Servidor
+const server = http.createServer(async (req, res) => {
+    const ip = getClientIP(req);
+
+    // Rate limiting
+    if (isRateLimited(ip)) {
+        res.statusCode = 429;
+        return res.end("Muitas requisições. Tente novamente mais tarde.");
+    }
+
+    // CORS – ajuste conforme seu frontend
+    const allowedOrigin = "*"; // ⚠️ Troque por "https://seudominio.com" em produção!
+    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    // Rotas OPTIONS (pré-voo CORS)
+    if (req.method === "OPTIONS") {
+        return res.end();
+    }
+
+    // POST
     if (req.method === "POST") {
-        let body = ""
-
+        let body = "";
         req.on("data", chunk => {
-            body += chunk.toString()
-        })
+            body += chunk.toString();
+        });
 
         req.on("end", () => {
             try {
-                const data = JSON.parse(body)
+                const data = JSON.parse(body);
 
-                // 📍 POSIÇÃO
+                // Rota /player
                 if (req.url === "/player") {
-                    players[data.name] = {
-                        x: data.x,
-                        y: data.y,
-                        z: data.z
+                    const name = sanitizeString(data.name, 16);
+                    const x = data.x; const y = data.y; const z = data.z;
+
+                    if (!name || !isValidNumber(x) || !isValidNumber(y) || !isValidNumber(z)) {
+                        res.statusCode = 400;
+                        return res.end("Dados inválidos: nome (string ≤16), x/y/z (números) obrigatórios.");
                     }
-                    res.end("player atualizado")
+
+                    // Gera ou reutiliza ID baseado no nome (ou use UUID se quiser sessões reais)
+                    const playerId = Buffer.from(name).toString("base64").substring(0, 12);
+                    players[playerId] = { name, x, y, z };
+                    return res.end("player atualizado");
                 }
 
-                // 💬 CHAT
+                // Rota /chat
                 else if (req.url === "/chat") {
-                    chat.push({
-                        name: data.name,
-                        msg: data.msg
-                    })
+                    const name = sanitizeString(data.name, 16);
+                    const msg = sanitizeString(data.msg, 100); // limite de 100 chars
 
-                    // limita chat
-                    if (chat.length > 20) {
-                        chat.shift()
+                    if (!name || !msg) {
+                        res.statusCode = 400;
+                        return res.end("Nome e mensagem são obrigatórios.");
                     }
 
-                    res.end("mensagem enviada")
+                    chat.push({ name, msg, time: Date.now() });
+                    if (chat.length > 20) chat.shift();
+
+                    return res.end("mensagem enviada");
                 }
 
                 else {
-                    res.end("rota inválida")
+                    res.statusCode = 404;
+                    return res.end("rota inválida");
                 }
-
-            } catch {
-                res.end("erro json")
+            } catch (e) {
+                console.error("Erro ao processar POST:", e.message);
+                res.statusCode = 400;
+                return res.end("erro json ou dados inválidos");
             }
-        })
+        });
+
+        req.on("error", () => {
+            res.statusCode = 400;
+            res.end("erro na requisição");
+        });
     }
 
-    // 📤 Enviar dados
+    // GET
     else if (req.method === "GET") {
-
-        // Jogadores
         if (req.url === "/players") {
-            res.end(JSON.stringify(players))
+            return res.end(JSON.stringify(players));
         }
-
-        // Chat
         else if (req.url === "/chat") {
-            res.end(JSON.stringify(chat))
+            return res.end(JSON.stringify(chat));
         }
-
-        // Status
         else if (req.url === "/status") {
-            res.end(JSON.stringify({
-                ram: getRAM(),
-                cpu: getCPU()
-            }))
+            const status = await getSystemStatus();
+            return res.end(JSON.stringify(status));
         }
-
-        else {
-            res.end("servidor online")
+        else {            return res.end("servidor online");
         }
     }
-})
 
-const PORT = process.env.PORT || 3000
+    // Métodos não suportados
+    else {
+        res.statusCode = 405;
+        return res.end("método não permitido");
+    }
+});
+
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log("🔥 Servidor rodando na porta " + PORT)
-})
+    console.log(`🔥 Servidor rodando na porta ${PORT}`);
+});
